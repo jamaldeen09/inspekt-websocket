@@ -14,3 +14,15 @@ export interface AuthData {
     keyId: string;
     userPlan: "free" | "pro";
 }
+
+export type ValidationRes = { msg: string; code: number } | null;
+export interface AnalysisResult {
+    success: boolean;
+    data?: any;
+    message: string;
+    error?: {
+        code: string;
+        statusCode: number;
+        details?: any;
+    };
+};

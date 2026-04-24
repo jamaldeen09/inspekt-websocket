@@ -1,11 +1,11 @@
 import { WebSocketServer } from 'ws';
-import { AnalysisMode, AuthData, ConfigOptions, ConnectionType } from './types';
+import { AnalysisMode, AnalysisResult, AuthData, ConfigOptions, ConnectionType } from './types';
 import { validateApiKey } from './lib/utils';
 import { verifyDashboardAccess, verifySdkAccess } from './lib/supabase/authentication';
+import InspektStream from './lib/inspekt/inspekt-stream';
 
 // Websocket server init
 const wss = new WebSocketServer({ port: 4090 });
-const connections = new Map<string, WebSocket>();
 
 wss.on("connection", async (ws, req) => {
     // Confirm a url exists mostly for ts errors 
@@ -112,94 +112,30 @@ wss.on("connection", async (ws, req) => {
         ws.close(1011, "An unexpected error occured during verification. Please try again shortly");
         return;
     };
+
+    // -- Create a new inspekt stream
+    const inspektStream = new InspektStream(authData, { 
+        redactKeys: parsed, 
+        analysisMode: analysisMode as ConfigOptions["analysisMode"],
+        type,
+        apiKey: apiKey ?? "",
+    });
+
+    // Add the verified user to the connections Map()
+    inspektStream.newSocketUser(ws);
+
+    // -- Listen for new message events
+    ws.onmessage = (event) => {
+        const decoded = InspektStream.decode(event.data as any);
+
+        if ("event" in decoded && decoded.event === "analysis:request") {
+            return inspektStream.log(decoded.data);
+        }
+    };
+
+
+    ws.onclose = (event) => {
+        inspektStream.removeSocketUser(ws);
+    }
 });
 
-
-class InspektStream {
-    // -- Connections tracking
-    public sdkConnections: Map<string, WebSocket> = new Map();
-    public dashboardConnections: Map<string, Set<WebSocket>> = new Map();
-
-    // -- Auth data and other options
-    private _authData: AuthData;
-    public configOptions: ConfigOptions;
-
-    constructor(authData: AuthData, configOptions: ConfigOptions) {
-        this._authData = authData;
-        this.configOptions = configOptions;
-    };
-    
-    /**
-     * This sends/emits a message to a connected socket/sockets
-     * @param userId - The userId of the connection 
-     * @param data - Data being emitted/sent 
-     */
-    public emit (userId: string, data: string | Object) {
-        const type = this.configOptions.type;
-        const finalData = typeof data === "string" ? data : InspektStream.encode(data);
-        
-        if (type === "dashboard") {
-            const sockets = this.dashboardConnections.get(userId);
-            if (!sockets || sockets.size === 0) {
-                console.warn(`[Socket message emittion failed]: Attempted to emit a message to: ${userId}, but no sockets were found (DASHBOARD)`);
-                return;
-            }
-            
-            return sockets.forEach((socket) => {
-                const isConnected = InspektStream.isWsConnected(socket);
-                if (isConnected) socket.send(finalData);
-            });
-        } else {
-            const socket = this.sdkConnections.get(userId);
-            if (!socket) {
-                console.warn(`[Socket message emittion failed]: Attempted to emit a message to: ${userId}, but socket was not found (SDK)`);
-                return;
-            }
-
-            const isConnected = InspektStream.isWsConnected(socket);
-            if (isConnected) socket.send(finalData);
-        }
-    }
-
-    /**
-     * Returns a boolean that confirms if 
-     * a websocket connection is connected/alive
-     * @param ws 
-     */
-    static isWsConnected (ws: WebSocket) {
-        return ws.readyState === ws.OPEN;
-    }
-
-    /**
-     * This method decodes buffers or binary data, processes and then
-     * parses it into structured JSON
-     * @param data - The JSON data being decoded
-     */
-    static decode (data: Buffer | ArrayBuffer) {
-        const firstByte = data[0];
-        if (firstByte !== 0) return null // This means we didn't receive JSON data, hence we can't process it
-
-        const payload = data.slice(0).toString() // Grab the actual bufferized json data;
-        const parsed = JSON.parse(payload) // parse it
-
-        return parsed;
-    }
-
-    /**
-     * This method encodes JSON data because the native ws package
-     * only sends data as a Buffer or a string. We need structured
-     * JSON for inspekt because it'll hold ai analysis data
-     * @param data - The JSON data being encoded 
-     */
-    static encode (data: Object) {
-        const stringifiedJson = JSON.stringify(data);
-        const concatenatedBuffer = Buffer.concat([Buffer.from([0]), Buffer.from(stringifiedJson)]);
-        return concatenatedBuffer;
-    };
-
-    public async analzye () {
-        try {} catch (err) {
-            
-        }
-    }
-}
