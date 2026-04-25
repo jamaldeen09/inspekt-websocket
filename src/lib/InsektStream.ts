@@ -130,7 +130,7 @@ class InspektStream {
                 request_headers: data.reqHeaders,
                 response_headers: data.resHeaders,
                 response_time: data.responseTime,
-                diagnosis_time: result.data.diagnosisTime,
+                analysis_time: result.data.analysisTime,
                 model_used: result.data.modelUsed ?? null,
                 tokens_used: result.data.tokensUsed ?? null,
                 body: data.body,
@@ -138,7 +138,7 @@ class InspektStream {
             }
 
             // Persist the actual log record
-            // This keeps a history of the API call and the AI's diagnosis
+            // This keeps a history of the API call and the AI's analysis
             const { data: logRecord, error: logError } = await adminClient
                 .from("logs")
                 .insert(logEntry)

@@ -207,7 +207,7 @@ class InspektAnalysis {
                 content: JSON.parse(content.replace(/```json|```/g, "").trim()),
                 tokensUsed,
                 modelUsed,
-                diagnosisTime: endTime - startTime,
+                analysisTime: endTime - startTime,
             }
         };
 
