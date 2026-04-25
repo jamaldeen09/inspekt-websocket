@@ -1,6 +1,6 @@
 import dotenv from "dotenv";
 import OpenAI from "openai";
-import { AnalysisResult } from "../../types";
+import { AnalysisResult } from "../types";
 dotenv.config();
 
 class InspektAnalysis {
@@ -160,7 +160,7 @@ class InspektAnalysis {
  * Executes the AI analysis with a robust fallback mechanism.
  * Categorizes errors to decide if a retry is viable or if it should fail immediately.
  */
-   public async analyze(
+    public async analyze(
         plan: "free" | "pro",
         rawData: any,
         redactKeys: string[]
@@ -184,6 +184,7 @@ class InspektAnalysis {
          * Throws a structured error so the parent can handle fallbacks.
          */
         const runAttempt = async (modelName: string, apiKey: string) => {
+            const startTime = Date.now();
             const openai = this.openaiSdk(apiKey);
             const completion = await openai.chat.completions.create({
                 model: modelName,
@@ -193,11 +194,21 @@ class InspektAnalysis {
                 ],
                 response_format: { type: "json_object" }
             });
-
+            const endTime = Date.now();
+            const tokensUsed = completion.usage?.total_tokens ?? null;
+            const modelUsed = modelName
             const content = completion.choices[0]?.message?.content;
-            if (!content) throw new Error("AI_EMPTY_RESPONSE");
 
-            return JSON.parse(content.replace(/```json|```/g, "").trim());
+            if (!content) {
+                throw new Error("AI_EMPTY_RESPONSE");
+            }
+
+            return {
+                content: JSON.parse(content.replace(/```json|```/g, "").trim()),
+                tokensUsed,
+                modelUsed,
+                diagnosisTime: endTime - startTime,
+            }
         };
 
         /**
@@ -207,21 +218,44 @@ class InspektAnalysis {
             const status = err?.status || err?.response?.status;
             const msg = err?.message || "";
 
-            if (status === 429) return { success: false, message: "The AI analysis is currently rate-limited. Please wait a moment.", error: { code: "RATE_LIMITED", statusCode: 429 } };
-            if (status === 401) return { success: false, message: "AI Configuration error: Invalid API key.", error: { code: "INVALID_API_KEY", statusCode: 401 } };
-            if ([502, 503, 504].includes(status)) return { success: false, message: "The AI model is currently overloaded or unavailable. Try again later.", error: { code: "MODEL_UNAVAILABLE", statusCode: status } };
-            if (status === 400 && msg.includes("context_length")) return { success: false, message: "The API response was too large for the AI to analyze.", error: { code: "CONTEXT_WINDOW_EXCEEDED", statusCode: 400 } };
+            if (msg === "AI_EMPTY_RESPONSE") return { 
+                msg: "AI returned an empty diagnosis. None of your diagnoses were lost", 
+                error: { code: "EMPTY_RESPONSE" } 
+            };
 
-            return { success: false, message: "AI Analysis failed due to an internal error.", error: { code: "AI_ANALYSIS_FAILED", statusCode: status ?? 500 } };
+            if (status === 429) return {
+                msg: "The AI analysis is currently rate-limited. Please wait a moment",
+                error: { code: "RATE_LIMITED" }
+            };
+
+            if ([502, 503, 504].includes(status)) return {
+                msg: "The AI model is currently overloaded or unavailable. Try again later.",
+                error: { code: "MODEL_UNAVAILABLE" }
+            };
+
+            if (status === 400 && msg.includes("context_length")) return {
+                msg: "The API response was too large for the AI to analyze",
+                error: { code: "CONTEXT_WINDOW_EXCEEDED" }
+            };
+
+            return { 
+                msg: "AI Analysis failed due to an internal error", 
+                error: { code: "AI_ANALYSIS_FAILED" } 
+            };
         };
 
         try {
             // --- ATTEMPT 1: Primary ---
             const data = await runAttempt(primary.name, primary.apiKey);
-            return { success: true, message: "Analysis successful", data };
-
+            return { msg: "Analysis successful", data };
         } catch (primaryErr: any) {
             const categorized = formatError(primaryErr);
+            const status = primaryErr?.status || primaryErr?.response?.status;
+
+            // Log invalid api key errors
+            if (status === 401) {
+                console.error(`[AI_ANALYSIS_ERROR]: Invalid API key`);
+            }
 
             // Decide: Should we fallback? 
             // We fallback on 429 (rate limit), 5xx (overload), or general failures.
@@ -229,11 +263,11 @@ class InspektAnalysis {
             const shouldRetry = ["RATE_LIMITED", "MODEL_UNAVAILABLE", "AI_ANALYSIS_FAILED"].includes(categorized.error!.code);
 
             if (shouldRetry) {
-                console.warn(`[AI_RETRY]: Primary ${primary.name} failed. Trying fallback ${fallback.name}...`);
+                console.warn(`[AI RETRY]: Primary ${primary.name} failed. Trying fallback ${fallback.name}...`);
                 try {
                     // --- ATTEMPT 2: Fallback ---
                     const data = await runAttempt(fallback.name, fallback.apiKey);
-                    return { success: true, message: "Analysis successful (via fallback)", data };
+                    return { msg: "Analysis successful (via fallback)", data };
                 } catch (fallbackErr) {
                     return formatError(fallbackErr);
                 }

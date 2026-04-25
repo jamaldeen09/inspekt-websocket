@@ -1,3 +1,5 @@
+import { WebSocket } from "ws";
+
 export type ConnectionType = "sdk" | "dashboard";
 export type AnalysisMode = "errors" | "always" | "never"
 
@@ -17,12 +19,16 @@ export interface AuthData {
 
 export type ValidationRes = { msg: string; code: number } | null;
 export interface AnalysisResult {
-    success: boolean;
+    msg: string;
     data?: any;
-    message: string;
-    error?: {
-        code: string;
-        statusCode: number;
-        details?: any;
-    };
+    error?: { code: string; };
 };
+
+export type ValidEvents = "new:analysis";
+export interface JsonSocketMessage {
+    event: ValidEvents;
+    data: any;
+}
+
+
+export type ExtendedWs = WebSocket & { isAlive?: boolean };  

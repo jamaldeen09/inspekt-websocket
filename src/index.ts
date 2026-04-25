@@ -1,13 +1,48 @@
 import { WebSocketServer } from 'ws';
-import { AnalysisMode, AnalysisResult, AuthData, ConfigOptions, ConnectionType } from './types';
+import { AnalysisMode, AuthData, ConfigOptions, ConnectionType, ExtendedWs, JsonSocketMessage } from './types';
 import { validateApiKey } from './lib/utils';
 import { verifyDashboardAccess, verifySdkAccess } from './lib/supabase/authentication';
-import InspektStream from './lib/inspekt/inspekt-stream';
+import InspektStream from './lib/InsektStream';
+import { connectionManager } from './lib/ConnectionManager';
 
 // Websocket server init
 const wss = new WebSocketServer({ port: 4090 });
 
-wss.on("connection", async (ws, req) => {
+// Mount the heartbeat that manages socket connections
+connectionManager.startHeartbeat();
+
+wss.on("connection", (ws: ExtendedWs, req) => {
+    // We catch the packets now, and process them later
+    // AFTER confirming the identity of the socket
+    let unprocessesMsgs: any[] = [];
+    let inspektStreamInstance: InspektStream | null = null;
+
+    // Message event
+    ws.onmessage = (event) => {
+        const message = typeof event.data === "string" ? event.data : InspektStream.decode(event.data);
+
+        // Allow pings
+        if (message === "ping") {
+            if (inspektStreamInstance) inspektStreamInstance.handlePing(ws, inspektStreamInstance.authData.userId);
+            else unprocessesMsgs.push(message);
+            return;
+        }
+
+        // Now that we know it has to be a json
+        // message we make sure the event is valid 
+        const isValidEvent =
+            typeof message === "object" &&
+            message !== null &&
+            "event" in message &&
+            message.event === "new:analysis" && "data" in message;
+
+        if (!isValidEvent) return;
+
+        if (inspektStreamInstance) {
+            inspektStreamInstance.log(message.data);
+        } else { unprocessesMsgs.push(message) }
+    };
+
     // Confirm a url exists mostly for ts errors 
     // but it still needs to be handled gracefully
     // because the url is essential
@@ -19,13 +54,13 @@ wss.on("connection", async (ws, req) => {
     // Extract the search params
     const { searchParams } = new URL(req.url, `http://${req.headers.host}`);
 
-
     // Get all the values that we care about
     const type = searchParams.get("type") as ConnectionType | null;
     const apiKey = searchParams.get("apiKey");
     const token = searchParams.get("token");
     const analysisMode = searchParams.get("analysisMode") ?? "errors" as AnalysisMode;
     const redactKeys = searchParams.get("redactKeys");
+    const keyId = searchParams.get("keyId");
 
     // -- Validate the compulsory fields 
 
@@ -35,17 +70,26 @@ wss.on("connection", async (ws, req) => {
         return;
     };
 
-    // ** API KEY - Extremely crucial for both the sdk and the dashboard stream
-    const validationRes = validateApiKey(apiKey);
-    if (validationRes) {
-        ws.close(validationRes.code, validationRes.msg);
-        return;
+    if (type === "sdk") {
+        // ** API KEY - Extremely crucial for both the dashboard stream
+        const res = validateApiKey(apiKey);
+        if (res) {
+            ws.close(res.code, res.msg);
+            return;
+        };
     }
 
-    // ** TOKEN - This is crucial for dashboard streams but optional for sdk streams
-    if (type === "dashboard" && !token) {
-        ws.close(1008, "Token is required because type has been set to dashboard");
-        return;
+    if (type === "dashboard") {
+        if (!token) {
+            // ** TOKEN - This is crucial for dashboard streams but optional for sdk streams
+            ws.close(1008, "Token is required because type has been set to dashboard");
+            return;
+        } else if (!keyId) {
+            // ** KEYID - This is extremely crucial for dashboard streams because
+            //            this is how we know which key the logs belong to
+            ws.close(4002, "Key ID is missing");
+            return;
+        }
     };
 
     // ** REDACT KEYS - This is crucial and must be provided, although in the sdk
@@ -77,65 +121,79 @@ wss.on("connection", async (ws, req) => {
         return;
     }
 
-    // -- Authenticate the person trying to connect
-    let authData: AuthData | null = null;
+    // Authenticate the socket
+    (async () => {
+        // -- Authenticate the person trying to connect
+        let authData: AuthData | null = null;
 
-    // ** Dashboard stream verification
-    if (type === "dashboard") {
-        const res = await verifyDashboardAccess(apiKey ?? "", token ?? "");
+        // ** Dashboard stream verification
+        if (type === "dashboard") {
+            const res = await verifyDashboardAccess(keyId ?? "", token ?? "");
 
-        // Handle unsuccesfull authentication
-        if (!res.success || !res.data) {
-            // Default code to server errors
-            ws.close(res.code ?? 1011, res.msg);
-            return;
-        };
+            // Handle unsuccesfull authentication
+            if (!res.success || !res.data) {
+                // Default code to server errors
+                ws.close(res.code ?? 1011, res.msg);
+                return;
+            };
 
-        authData = res.data;
-    }
-
-    // ** SDK stream verification
-    if (type === "sdk") {
-        const res = await verifySdkAccess(apiKey ?? "");
-        // Handle unsuccesfull authentication
-        if (!res.success || !res.data) {
-            // Default code to server errors
-            ws.close(res.code ?? 1011, res.msg);
-            return;
-        };
-
-        authData = res.data;
-    };
-
-    // ** EDGECASE: If somehow authData is null or undefined even after verification
-    if (!authData) {
-        ws.close(1011, "An unexpected error occured during verification. Please try again shortly");
-        return;
-    };
-
-    // -- Create a new inspekt stream
-    const inspektStream = new InspektStream(authData, { 
-        redactKeys: parsed, 
-        analysisMode: analysisMode as ConfigOptions["analysisMode"],
-        type,
-        apiKey: apiKey ?? "",
-    });
-
-    // Add the verified user to the connections Map()
-    inspektStream.newSocketUser(ws);
-
-    // -- Listen for new message events
-    ws.onmessage = (event) => {
-        const decoded = InspektStream.decode(event.data as any);
-
-        if ("event" in decoded && decoded.event === "analysis:request") {
-            return inspektStream.log(decoded.data);
+            authData = res.data;
         }
-    };
 
+        // ** SDK stream verification
+        if (type === "sdk") {
+            const res = await verifySdkAccess(apiKey ?? "");
+            // Handle unsuccesfull authentication
+            if (!res.success || !res.data) {
+                // Default code to server errors
+                ws.close(res.code ?? 1011, res.msg);
+                return;
+            };
 
-    ws.onclose = (event) => {
-        inspektStream.removeSocketUser(ws);
-    }
+            authData = res.data;
+        };
+
+        // -- Create a new inspekt stream
+        inspektStreamInstance = new InspektStream(authData!, {
+            redactKeys: parsed,
+            analysisMode: analysisMode as ConfigOptions["analysisMode"],
+            type,
+            apiKey: apiKey ?? "",
+        });
+
+        // Set the isAlive property to true
+        console.log(`[Connection]: User ${authData!.userId} is connected`);
+        ws.isAlive = true;
+
+        // Add the socket a the appropriate pool
+        connectionManager.newSocket({
+            connectionList: inspektStreamInstance.configOptions.type,
+            userId: inspektStreamInstance.authData.userId,
+            socket: ws,
+        });
+
+        // -- Process the unprocessed messages
+        unprocessesMsgs.forEach((msg) => {
+
+            // Handle unprocessed ping messages
+            if (typeof msg === "string" && msg === "ping") {
+                inspektStreamInstance!.handlePing(ws, authData!.userId);
+                return;
+            }
+
+            // Handle unprocessed json messages
+            else {
+                const typed = msg as JsonSocketMessage;
+                switch (typed.event) {
+                    case "new:analysis":
+                        inspektStreamInstance!.log(typed.data);
+                        break;
+                }
+            };
+        });
+
+        // Reset the unprocessed messages
+        unprocessesMsgs = [];
+    })();
 });
 
